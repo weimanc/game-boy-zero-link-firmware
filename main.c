@@ -35,6 +35,15 @@
 #include "hardware/pio.h"
 #include "pio/pio_spi.h"
 #include "pico/time.h"
+
+#define NUM_CMP_BYTES 0x20
+#define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
+
+#define NUM_DEFAULT_BYTES_PER_TRANSFER 1
+#define US_DEFAULT_PER_TRANSFER 1000
+
+#define MAX_TRANSFER_BYTES 0x40
+
 const uint SI_PIN = 3;
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTYPES
@@ -55,8 +64,11 @@ enum  {
 };
 
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
-static uint8_t data_buf[0x40];
+static uint8_t data_buf[MAX_TRANSFER_BYTES];
+static uint8_t compare_bytes[NUM_CMP_BYTES] = {0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF};
 static uint8_t buf_count;
+static uint8_t num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
+static uint32_t us_between_transfer = US_DEFAULT_PER_TRANSFER;
 static uint32_t total_transferred = 0;
 
 #define URL  "tetris.stacksmashing.net"
@@ -72,6 +84,7 @@ const tusb_desc_webusb_url_t desc_url =
 static bool web_serial_connected = false;
 
 //------------- prototypes -------------//
+void handle_input_data(void);
 void data_transfer_task(void);
 void led_blinking_task(void);
 void cdc_task(void);
@@ -91,7 +104,7 @@ void webserial_task(void);
 
 int main(void)
 {
-  board_init();
+  //board_init();
   buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
   pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
@@ -216,6 +229,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       web_serial_connected = (request->wValue != 0);
       
       total_transferred = 0;
+      num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
+      us_between_transfer = US_DEFAULT_PER_TRANSFER;
 
       // Always lit LED if connected
       if ( web_serial_connected )
@@ -251,52 +266,63 @@ bool tud_vendor_control_complete_cb(uint8_t rhport, tusb_control_request_t const
 }
 
 void data_transfer_task(void) {
-    if(buf_count) {
-        //uint8_t buf_out[0x40];
-        for(int i = 0; i < (buf_count+3) >> 2; i++) {
-            pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
-            busy_wait_us(36);
-        }
+    //if(buf_count) {
+        //uint8_t buf_out[MAX_TRANSFER_BYTES];
+    //    for(int i = 0; i < (buf_count+3) >> 2; i++) {
+    //        pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
+    //        busy_wait_us(36);
+    //    }
         //pio_spi_write8_read8_blocking(&spi, data_buf, buf_out, buf_count);
         //echo_all(buf_out, buf_count);
-        buf_count = 0;
+    //    buf_count = 0;
+    //}
+}
+
+void handle_input_data(void) {
+  uint8_t buf_in[MAX_TRANSFER_BYTES*2];
+  uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
+  for(int i = count; i < (MAX_TRANSFER_BYTES*2); i++)
+    buf_in[i] = 0;
+  uint8_t processed = 0;
+  if(count == NUM_CMP_BYTES_RECV) {
+    uint8_t failed = 0;
+    for(int i = 0; i < NUM_CMP_BYTES; i++)
+      if(buf_in[i] != compare_bytes[i]) {
+        failed = 1;
+        break;
+      }
+    if(!failed) {
+      us_between_transfer = (buf_in[NUM_CMP_BYTES]<<0) + (buf_in[NUM_CMP_BYTES+1]<<8) + (buf_in[NUM_CMP_BYTES+2]<<16);
+      num_bytes_per_transfer = buf_in[NUM_CMP_BYTES+3];
+      if(num_bytes_per_transfer > MAX_TRANSFER_BYTES)
+        num_bytes_per_transfer = MAX_TRANSFER_BYTES;
+      processed = 1;
+      echo_all(&processed, 1);
     }
+  }
+  if(!processed) {
+    // pprintf("Sending: %02x", buf[0]);
+    uint8_t total_processed = 0;
+    uint8_t buf_out[MAX_TRANSFER_BYTES*2];
+    while(total_processed < count) {
+      uint8_t transferable = num_bytes_per_transfer;
+      //if(count-total_processed < transferable)
+        //transferable = count-total_processed;
+      pio_spi_write8_read8_blocking(&spi, buf_in + total_processed, buf_out + total_processed, transferable);
+      total_transferred += transferable;
+      total_processed += transferable;
+      busy_wait_us(us_between_transfer);
+    }
+    echo_all(buf_out, total_processed);
+    //echo_all(&availables, 1);
+  }
 }
 
 void webserial_task(void)
 {
   if ( web_serial_connected )
-  {
-    uint32_t availables = tud_vendor_available();
-    if (availables)
-    {
-      uint8_t buf_in[0x40];
-      uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
-      if(count <= 4) {
-        // pprintf("Sending: %02x", buf[0]);
-        total_transferred += count;
-        uint8_t buf_out[0x40];
-        pio_spi_write8_read8_blocking(&spi, buf_in, buf_out, count);
-        busy_wait_us(36);
-        echo_all(buf_out, count);
-        //echo_all(&availables, 1);
-      }
-      else {
-        if(count == 0x3E) {
-          echo_all(&total_transferred, 4);
-          total_transferred = 0;
-        }
-        else {
-          for(int i = 0; i < count; i++)
-            data_buf[i] = buf_in[i];
-          buf_count = count;
-          total_transferred += count;
-        }
-      }
-      // echo back to both web serial and cdc
-      // echo_all(buf, count);
-    }
-  }
+    if ( tud_vendor_available() )
+      handle_input_data();
 }
 
 
@@ -306,29 +332,9 @@ void webserial_task(void)
 void cdc_task(void)
 {
   if ( tud_cdc_connected() )
-  {
     // connected and there are data available
     if ( tud_cdc_available() )
-    {
-      
-      uint8_t buf[1];
-      uint32_t count = tud_vendor_read(buf, sizeof(buf));
-      if(count) {
-        unsigned char rx;
-        pio_spi_write8_read8_blocking(&spi, buf, &rx, 1);
-        echo_all(&rx, 1);
-      }
-      // echo back to both web serial and cdc
-      // echo_all(buf, count);
-    
-      // uint8_t buf[64];
-
-      // uint32_t count = tud_cdc_read(buf, sizeof(buf));
-
-      // // echo back to both web serial and cdc
-      // echo_all(buf, count);
-    }
-  }
+      handle_input_data();
 }
 
 // Invoked when cdc when line state changed e.g connected/disconnected
