@@ -32,9 +32,9 @@
 #include "usb_descriptors.h"
 #include <stdio.h>
 #include <string.h>
-#include "tusb.h"
 #include "hardware/pio.h"
 #include "pio/pio_spi.h"
+#include "pico/time.h"
 const uint SI_PIN = 3;
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTYPES
@@ -55,6 +55,9 @@ enum  {
 };
 
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+static uint8_t data_buf[0x40];
+static uint8_t buf_count;
+static uint32_t total_transferred = 0;
 
 #define URL  "tetris.stacksmashing.net"
 
@@ -69,6 +72,7 @@ const tusb_desc_webusb_url_t desc_url =
 static bool web_serial_connected = false;
 
 //------------- prototypes -------------//
+void data_transfer_task(void);
 void led_blinking_task(void);
 void cdc_task(void);
 void webserial_task(void);
@@ -87,14 +91,17 @@ void webserial_task(void);
 
 int main(void)
 {
+  board_init();
+  buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
-  pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
+  pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
 
   tusb_init();
 
   while (1)
   {
     tud_task(); // tinyusb device task
+    data_transfer_task();
     cdc_task();
     webserial_task();
     led_blinking_task();
@@ -177,9 +184,14 @@ void tud_resume_cb(void)
 // WebUSB use vendor class
 //--------------------------------------------------------------------+
 
-// Invoked when received VENDOR control request
-bool tud_vendor_control_request_cb(uint8_t rhport, tusb_control_request_t const * request)
+// Invoked when a control transfer occurred on an interface of this class
+// Driver response accordingly to the request and the transfer stage (setup/data/ack)
+// return false to stall control endpoint (e.g unsupported request)
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
 {
+  // nothing to do for DATA & ACK stage
+  if (stage != CONTROL_STAGE_SETUP) return true;
+
   switch (request->bRequest)
   {
     case VENDOR_REQUEST_WEBUSB:
@@ -199,11 +211,11 @@ bool tud_vendor_control_request_cb(uint8_t rhport, tusb_control_request_t const 
       {
         return false;
       }
-
     case 0x22:
-      // Webserial simulate the CDC_REQUEST_SET_CONTROL_LINE_STATE (0x22) to
-      // connect and disconnect.
+      // Webserial simulate the CDC_REQUEST_SET_CONTROL_LINE_STATE (0x22) to connect and disconnect.
       web_serial_connected = (request->wValue != 0);
+      
+      total_transferred = 0;
 
       // Always lit LED if connected
       if ( web_serial_connected )
@@ -219,13 +231,13 @@ bool tud_vendor_control_request_cb(uint8_t rhport, tusb_control_request_t const 
 
       // response with status OK
       return tud_control_status(rhport, request);
+      break;
 
-    default:
-      // stall unknown request
-      return false;
+    default: break;
   }
 
-  return true;
+  // stall unknown request
+  return false;
 }
 
 // Invoked when DATA Stage of VENDOR's request is complete
@@ -238,19 +250,48 @@ bool tud_vendor_control_complete_cb(uint8_t rhport, tusb_control_request_t const
   return true;
 }
 
+void data_transfer_task(void) {
+    if(buf_count) {
+        //uint8_t buf_out[0x40];
+        for(int i = 0; i < (buf_count+3) >> 2; i++) {
+            pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
+            busy_wait_us(36);
+        }
+        //pio_spi_write8_read8_blocking(&spi, data_buf, buf_out, buf_count);
+        //echo_all(buf_out, buf_count);
+        buf_count = 0;
+    }
+}
+
 void webserial_task(void)
 {
   if ( web_serial_connected )
   {
-    if ( tud_vendor_available() )
+    uint32_t availables = tud_vendor_available();
+    if (availables)
     {
-      uint8_t buf[1];
-      uint32_t count = tud_vendor_read(buf, sizeof(buf));
-      if(count) {
+      uint8_t buf_in[0x40];
+      uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
+      if(count <= 4) {
         // pprintf("Sending: %02x", buf[0]);
-        unsigned char rx;
-        pio_spi_write8_read8_blocking(&spi, buf, &rx, 1);
-        echo_all(&rx, 1);
+        total_transferred += count;
+        uint8_t buf_out[0x40];
+        pio_spi_write8_read8_blocking(&spi, buf_in, buf_out, count);
+        busy_wait_us(36);
+        echo_all(buf_out, count);
+        //echo_all(&availables, 1);
+      }
+      else {
+        if(count == 0x3E) {
+          echo_all(&total_transferred, 4);
+          total_transferred = 0;
+        }
+        else {
+          for(int i = 0; i < count; i++)
+            data_buf[i] = buf_in[i];
+          buf_count = count;
+          total_transferred += count;
+        }
       }
       // echo back to both web serial and cdc
       // echo_all(buf, count);
