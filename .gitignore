@@ -3,6 +3,7 @@ elf2uf2/*
 generated/*
 pico-sdk/*
 pioasm/*
+_deps/*
 Makefile
 *.hex
 *.uf2

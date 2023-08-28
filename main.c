@@ -84,7 +84,7 @@ const tusb_desc_webusb_url_t desc_url =
 static bool web_serial_connected = false;
 
 //------------- prototypes -------------//
-void handle_input_data(void);
+void handle_input_data(uint8_t* buf_in, uint32_t count);
 void data_transfer_task(void);
 void led_blinking_task(void);
 void cdc_task(void);
@@ -147,6 +147,7 @@ void echo_all(uint8_t buf[], uint32_t count)
   if ( web_serial_connected )
   {
     tud_vendor_write(buf, count);
+    tud_vendor_flush();
   }
 
   // echo to cdc
@@ -155,8 +156,6 @@ void echo_all(uint8_t buf[], uint32_t count)
     for(uint32_t i=0; i<count; i++)
     {
       tud_cdc_write_char(buf[i]);
-
-      if ( buf[i] == '\r' ) tud_cdc_write_char('\n');
     }
     tud_cdc_write_flush();
   }
@@ -278,9 +277,7 @@ void data_transfer_task(void) {
     //}
 }
 
-void handle_input_data(void) {
-  uint8_t buf_in[MAX_TRANSFER_BYTES*2];
-  uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
+void handle_input_data(uint8_t* buf_in, uint32_t count) {
   for(int i = count; i < (MAX_TRANSFER_BYTES*2); i++)
     buf_in[i] = 0;
   uint8_t processed = 0;
@@ -321,8 +318,11 @@ void handle_input_data(void) {
 void webserial_task(void)
 {
   if ( web_serial_connected )
-    if ( tud_vendor_available() )
-      handle_input_data();
+    if ( tud_vendor_available() ) {
+      uint8_t buf_in[MAX_TRANSFER_BYTES*2];
+      uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
+      handle_input_data(buf_in, count);
+    }
 }
 
 
@@ -333,8 +333,11 @@ void cdc_task(void)
 {
   if ( tud_cdc_connected() )
     // connected and there are data available
-    if ( tud_cdc_available() )
-      handle_input_data();
+    if ( tud_cdc_available() ) {
+      uint8_t buf_in[MAX_TRANSFER_BYTES*2];
+      uint32_t count = tud_cdc_read((uint8_t*)buf_in, sizeof(buf_in));
+      handle_input_data(buf_in, count);
+    }
 }
 
 // Invoked when cdc when line state changed e.g connected/disconnected
