@@ -44,7 +44,24 @@
 
 #define MAX_TRANSFER_BYTES 0x40
 
-const uint SI_PIN = 3;
+#define PIN_SCK 0
+#define PIN_SIN 1
+#define TEST_PIN 6
+
+uint PIN_SOUT = 2;
+uint SI_PIN = 3;
+
+bool is_test_pin_grounded() {
+  gpio_init(TEST_PIN);
+  gpio_set_dir(TEST_PIN, GPIO_OUT);
+  gpio_put(TEST_PIN, 1);  // Set the pin high
+
+  // Read the state of the pin
+  bool grounded = gpio_get(TEST_PIN) == 0;
+
+  return grounded;
+}
+
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTYPES
 //--------------------------------------------------------------------+
@@ -71,7 +88,7 @@ static uint8_t num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
 static uint32_t us_between_transfer = US_DEFAULT_PER_TRANSFER;
 static uint32_t total_transferred = 0;
 
-#define URL  "tetris.stacksmashing.net"
+#define URL  "tetris.gblink.io"
 
 const tusb_desc_webusb_url_t desc_url =
 {
@@ -98,12 +115,20 @@ void webserial_task(void);
   };
 
 
-#define PIN_SCK 0
-#define PIN_SIN 1
-#define PIN_SOUT 2
-
 int main(void)
 {
+  // Check the state of TEST_PIN
+  if (is_test_pin_grounded()) {
+    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
+    PIN_SOUT = 3;
+    SI_PIN = 4;
+  }
+  else {
+    // GPIO 6 (TEST_PIN) is not grounded, use default values
+    PIN_SOUT = 2;
+    SI_PIN = 3;
+  }
+
   //board_init();
   buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
