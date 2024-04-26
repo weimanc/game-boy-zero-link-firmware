@@ -8,7 +8,9 @@ pico_sdk_init()
 
 add_executable(gbusb)
 
+# generate the header file into the source tree as it is included in the RP2040 datasheet
 pico_generate_pio_header(gbusb ${CMAKE_CURRENT_LIST_DIR}/pio/spi.pio)
+pico_generate_pio_header(gbusb ${CMAKE_CURRENT_LIST_DIR}/pio/ws2812.pio)
 
 target_include_directories(gbusb PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 

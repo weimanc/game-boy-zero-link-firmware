@@ -33,8 +33,64 @@
 #include <stdio.h>
 #include <string.h>
 #include "hardware/pio.h"
+#include "hardware/structs/ioqspi.h"
 #include "pio/pio_spi.h"
 #include "pico/time.h"
+#include "ws2812.pio.h"
+
+
+//--------------------------------------------------------------------+
+// BOOTSEL BUTTON
+//--------------------------------------------------------------------+
+bool __no_inline_not_in_flash_func(local_get_bootsel_button)() {
+    const uint CS_PIN_INDEX = 1;
+
+    // Must disable interrupts, as interrupt handlers may be in flash, and we
+    // are about to temporarily disable flash access!
+    uint32_t flags = save_and_disable_interrupts();
+
+    // Set chip select to Hi-Z
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    // Note we can't call into any sleep functions in flash right now
+    for (volatile int i = 0; i < 1000; ++i);
+
+    // The HI GPIO registers in SIO can observe and control the 6 QSPI pins.
+    // Note the button pulls the pin *low* when pressed.
+    bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+
+    // Need to restore the state of chip select, else we are going to have a
+    // bad time when we return to code in flash!
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    restore_interrupts(flags);
+
+    return button_state;
+}
+
+
+//--------------------------------------------------------------------+
+// WS2812 defines
+//--------------------------------------------------------------------+
+#define IS_RGBW true
+#define NUM_PIXELS 1
+#define WS2812_PIN 16
+
+static inline void put_pixel(uint32_t pixel_grb) {
+    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
+}
+
+static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return
+            ((uint32_t) (r) << 8) |
+            ((uint32_t) (g) << 16) |
+            (uint32_t) (b);
+}
+
 
 #define NUM_CMP_BYTES 0x20
 #define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
@@ -52,6 +108,7 @@ uint PIN_SOUT = 2;
 uint SI_PIN = 3;
 
 bool is_test_pin_grounded() {
+  return false;
   gpio_init(TEST_PIN);
   gpio_set_dir(TEST_PIN, GPIO_OUT);
   gpio_put(TEST_PIN, 1);  // Set the pin high
@@ -75,12 +132,18 @@ enum  {
   BLINK_NOT_MOUNTED = 250,
   BLINK_MOUNTED     = 1000,
   BLINK_SUSPENDED   = 2500,
-
   BLINK_ALWAYS_ON   = UINT32_MAX,
-  BLINK_ALWAYS_OFF  = 0
+  BLINK_ALWAYS_OFF  = 0,
+  COLOUR_NOT_MOUNTED = 0xFF0000, //red
+  COLOUR_MOUNTED     = 0x00FF00, //green
+  COLOUR_SUSPENDED   = 0x0000FF, //blue
+  COLOUR_ALWAYS_ON   = 0xFFFFFF, //white
+  COLOUR_ALWAYS_OFF  = 0x000000  //off
 };
 
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+static uint32_t pixel_rgb_on = 0;
+static uint32_t pixel_rgb_off = 0;
 static uint8_t data_buf[MAX_TRANSFER_BYTES];
 static uint8_t compare_bytes[NUM_CMP_BYTES] = {0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF};
 static uint8_t buf_count;
@@ -104,19 +167,24 @@ static bool web_serial_connected = false;
 void handle_input_data(uint8_t* buf_in, uint32_t count);
 void data_transfer_task(void);
 void led_blinking_task(void);
+void button_task(void);
 void cdc_task(void);
 void webserial_task(void);
 
 /*------------- MAIN -------------*/
-
-  pio_spi_inst_t spi = {
-          .pio = pio1,
-          .sm = 0
-  };
-
+pio_spi_inst_t spi = {
+  .pio = pio1,
+  .sm = 0
+};
 
 int main(void)
 {
+  // WS2812 init
+  PIO ws2812_pio = pio0;
+  int ws2812_sm = 0;
+  uint offset = pio_add_program(ws2812_pio, &ws2812_program);
+  ws2812_program_init(ws2812_pio, ws2812_sm, offset, WS2812_PIN, 800000, IS_RGBW);
+  pixel_rgb_on = urgb_u32(0xff, 0, 0);
   // Check the state of TEST_PIN
   if (is_test_pin_grounded()) {
     // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
@@ -128,6 +196,8 @@ int main(void)
     PIN_SOUT = 2;
     SI_PIN = 3;
   }
+  
+  // SPI init
 
   //board_init();
   buf_count = 0;
@@ -143,6 +213,7 @@ int main(void)
     cdc_task();
     webserial_task();
     led_blinking_task();
+    button_task();
   }
 
   return 0;
@@ -194,12 +265,14 @@ void echo_all(uint8_t buf[], uint32_t count)
 void tud_mount_cb(void)
 {
   blink_interval_ms = BLINK_MOUNTED;
+  pixel_rgb_on = COLOUR_MOUNTED;
 }
 
 // Invoked when device is unmounted
 void tud_umount_cb(void)
 {
   blink_interval_ms = BLINK_NOT_MOUNTED;
+  pixel_rgb_on = COLOUR_NOT_MOUNTED;
 }
 
 // Invoked when usb bus is suspended
@@ -209,12 +282,14 @@ void tud_suspend_cb(bool remote_wakeup_en)
 {
   (void) remote_wakeup_en;
   blink_interval_ms = BLINK_SUSPENDED;
+  pixel_rgb_on = COLOUR_SUSPENDED;
 }
 
 // Invoked when usb bus is resumed
 void tud_resume_cb(void)
 {
   blink_interval_ms = BLINK_MOUNTED;
+  pixel_rgb_on = COLOUR_MOUNTED;
 }
 
 //--------------------------------------------------------------------+
@@ -261,11 +336,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       {
         board_led_write(true);
         blink_interval_ms = BLINK_ALWAYS_ON;
+        pixel_rgb_on = COLOUR_ALWAYS_ON;
 
         // tud_vendor_write_str("\r\nTinyUSB WebUSB device example\r\n");
       }else
       {
         blink_interval_ms = BLINK_MOUNTED;
+        pixel_rgb_on = COLOUR_MOUNTED;
       }
 
       // response with status OK
@@ -391,11 +468,37 @@ void led_blinking_task(void)
 {
   static uint32_t start_ms = 0;
   static bool led_state = false;
+  static uint32_t prev_pixel_rgb = 0;
+
+  // just update when colour changed
+  if (prev_pixel_rgb != pixel_rgb_on) {
+    led_state ? put_pixel(pixel_rgb_on) : put_pixel(pixel_rgb_off) ;
+  }  
 
   // Blink every interval ms
   if ( board_millis() - start_ms < blink_interval_ms) return; // not enough time
   start_ms += blink_interval_ms;
 
   board_led_write(led_state);
+
   led_state = 1 - led_state; // toggle
+}
+
+
+//--------------------------------------------------------------------+
+// BUTTON TASK
+//--------------------------------------------------------------------+
+void button_task(void) {
+  // static uint32_t start_ms = 0;
+  // static uint32_t sample_interval_ms = 20;
+  // static bool button_state = false;
+  
+  // // Blink every interval ms
+  // if ( board_millis() - start_ms < sample_interval_ms) return; // not enough time
+  // start_ms += sample_interval_ms;
+
+  if (local_get_bootsel_button()) {
+    pixel_rgb_on = rand();
+    pixel_rgb_off = 0;
+  }
 }
